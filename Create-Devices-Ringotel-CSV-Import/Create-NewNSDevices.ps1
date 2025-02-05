@@ -1,0 +1,420 @@
+<#
+.SYNOPSIS
+    Creates new devices for NetSapiens subscribers based on provided extensions or a CSV file. 
+    Optionally, create CSV import files designed for use in creating new users in the 
+    Ringotel VoIP app service that connect to the PBX devices.
+
+.DESCRIPTION
+    This script creates new devices for NetSapiens subscribers in a specified domain. It can process
+    extensions provided as an array or from a CSV file. The script checks for existing devices and
+    creates new ones as needed, generating a CSV file for active and inactive extensions.
+
+    REQUIREMENTS/DEPENDENCIES:
+    You must do this first: Place the NetSapiensAPI module folder  in the same directory as this script
+    The module is located at: https://github.com/dszp/NetSapiensAPI
+
+    1Password CLI is required to fetch the NetSapiens API credentials. The 1Password CLI is documented at:
+    https://developer.1password.com/docs/cli/get-started/ and you must have a 1Password account and save 
+    your API credentials in 1Password and access them via the correct vault paths. Alternately, 
+    you can modify the script to insert your own credentials directly or using your own secrets management 
+    system in place of pulling them from 1Password.
+
+.NOTES
+    Version:         0.0.1
+    Last Updated:    2025-02-05
+    Author:          David Szpunar
+    
+    Version History:
+    0.0.1 - 2025-02-05
+        * Initial release
+        * Basic functionality for creating new devices for import into Ringotel from NetSapiens.
+        * Support for CSV input and direct extension array input
+        * Multiple switch options to control behavior, including creating import files, reporting only, etc.
+        * Command-line only (no GUI). Requires NetSapiensAPI module to be in the same directory as this script.
+        * NetSapiens API credentials are required; the script pulls them from 1Password using the 1Password 
+          CLI by default.
+
+.PARAMETER DomainName
+    The NetSapiens domain name to operate on.
+
+.PARAMETER Extensions
+    An array of extension numbers to process. Use this to provide a set of extensions to activate 
+    on the command line rather than by providing a CSV file using -CsvSource. Overridden if a CSV 
+    file is specified using -CsvSource.
+
+.PARAMETER CsvSource
+    Path to a CSV file containing extension numbers. Use this to provide a set of extensions to 
+    activate from a CSV file rather than by providing an array of extensions using -Extensions. 
+    If specified, this parameter takes precedence over -Extensions. The file must be in CSV format 
+    and must have column names on the first line. Any column name that starts with "ext" will be 
+    used to determine the extension numbers column; all other columns will be ignored. An error 
+    will be raised if the file is not found, is not in CSV format, or does not have exactly one
+    header that starts with "ext".
+
+.PARAMETER Suffix
+    Optional suffix to append to the extension when creating new devices. Default is 'r'.
+
+.PARAMETER UseCallerIdName
+    Switch to use the Caller ID Name instead of the subscriber's full name in the output CSV files.
+
+.PARAMETER CreateBillable
+    Switch to allow creation of new billable devices (device added to an extension that has no devices already).
+
+.PARAMETER ReportOnly
+    Switch to prevent creation of new devices and only report on existing devices. An alert will be output 
+    where a device would have been crated, but extensions will be added to the Inactive list/export 
+    rather than being created.
+
+.PARAMETER CreateImportFiles
+    Switch to create import files for Ringotel (active and inactive), based on the various OutputFilePath 
+    parameters that are available. Files will only be created if there is one or more device to list.
+
+.PARAMETER OutputFilePath
+    Path for the output CSV file for newly created active devices to import into Ringotel. 
+    Default is './ringotel_import.csv' in the current folder. SIP credentials are included 
+    in this file, keep it safe!
+
+.PARAMETER OutputFilePathAlreadyActive
+    Path for the output CSV file for existing Ringotel-active devices to re-import into Ringotel or review. 
+    Default is './ringotel_alreadyactive.csv' in the current folder. SIP credentials are included 
+    in this file, keep it safe!
+
+.PARAMETER OutputFilePathAlreadyInactive
+    Path for the output CSV file for all non-system PBX domain extensions for review or for import into 
+    Ringotel as Inactive users for directory purposes (keep mind importing over top of existing inactive 
+    users will DUPLICATE users in Ringotel!). 
+    Default is './ringotel_inactive_import.csv' in the current folder. SIP credentials are NOT in this file.
+
+.EXAMPLE
+    .\Create-NewNSDevices.ps1 -DomainName "example.0000.service" -Extensions 1001,1002,1003 -CreateBillable -CreateImportFiles
+
+.EXAMPLE
+    .\Create-NewNSDevices.ps1 -DomainName "example.0000.service" -CsvPath "extensions.csv" -Suffix "x" -UseCallerIdName -CreateImportFiles
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'Array')]
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$DomainName,
+
+    [Parameter(
+        ParameterSetName = 'Array',
+        Position = 0,
+        ValueFromPipeline = $true,
+        ValueFromPipelineByPropertyName = $true
+    )]
+    [string[]]$Extensions,
+
+    [Parameter(
+        ParameterSetName = 'File',
+        Position = 0,
+        ValueFromPipelineByPropertyName = $true
+    )]
+    [ValidateScript({
+            if (-not (Test-Path -Path $_ -PathType Leaf)) {
+                throw "File not found: $_"
+            }
+            if (-not ($_ -match '\.csv$')) {
+                throw "File must be a CSV file"
+            }
+            $true
+        })]
+    [string]$CsvSource,
+
+    [Parameter(Mandatory = $false)]
+    [string]$Suffix = "r",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$UseCallerIdName,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$CreateBillable,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$CreateImportFiles,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ReportOnly,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFilePath = './ringotel_import.csv',
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFilePathInactive = './ringotel_inactive_import.csv',
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFilePathAlreadyActive = './ringotel_alreadyactive.csv'
+)
+
+# MUST DO THIS FIRST: Place the NetSapiensAPI module in the same directory as this script
+# The module is located at: https://github.com/dszp/NetSapiensAPI
+
+# Get the current script's directory and construct module path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$modulePath = Join-Path $scriptDir "NetSapiensAPI"
+
+# Verify module file exists
+if (-not (Test-Path $modulePath)) {
+    throw "Module manifest not found at: $modulePath"
+}
+
+# Import the module
+Import-Module $modulePath -Force
+
+# Example configuration - replace with your values
+$NsConfig = @{
+    BaseUrl      = "https://api.ucaasnetwork.com"
+    ClientId     = $(op read op://Employee/netsapiens-script/clientid)
+    ClientSecret = $(op read op://Employee/netsapiens-script/clientsecret)
+    Domain       = $DomainName
+}
+
+# Create credential object
+$securePassword = ConvertTo-SecureString $(op read op://Employee/netsapiens-script/credential) -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($(op read op://Employee/netsapiens-script/username), $securePassword)
+
+# Initialize arrays for CSV output
+$csvActive = New-Object System.Collections.Generic.List[object]
+$csvInactive = New-Object System.Collections.Generic.List[object]
+$csvAlreadyActive = New-Object System.Collections.Generic.List[object]
+
+# Connect to NetSapiens
+Write-Host "Connecting to NetSapiens..." -ForegroundColor Cyan
+Connect-NSServer -BaseUrl $NsConfig.BaseUrl -ClientId $NsConfig.ClientId -ClientSecret $NsConfig.ClientSecret -Credential $credential
+
+##### FUNCTIONS #####
+
+<#
+.SYNOPSIS
+Finds extensions from either an array or a CSV file.
+
+.DESCRIPTION
+The Find-Extensions function processes input extensions either directly from an array or from a CSV file. It supports two parameter sets: 'Array' for direct input and 'File' for CSV file input.
+
+.PARAMETER Extensions
+An array of extension strings to process. This parameter is part of the 'Array' parameter set.
+
+.PARAMETER CsvPath
+The path to a CSV file containing extensions. The file must have a header that starts with 'ext'. This parameter is part of the 'File' parameter set.
+
+.EXAMPLE
+Find-Extensions -Extensions "101", "102", "103"
+Processes the extensions 101, 102, and 103 directly.
+
+.EXAMPLE
+Find-Extensions -CsvPath "path/to/your/file.csv"
+Reads extensions from the specified CSV file and processes them.
+
+.EXAMPLE
+"101", "102", "103" | Find-Extensions
+Demonstrates how to use pipeline input to process extensions.
+
+.NOTES
+- The function validates the CSV file to ensure it exists and has a .csv extension.
+- When using a CSV file, the function looks for a header starting with 'ext' to identify the column containing extensions.
+- The function returns an array of extensions, which can be empty if no valid extensions are found.
+
+.OUTPUTS
+System.String[]
+Returns an array of extension strings.
+#>
+function Find-Extensions {
+    [CmdletBinding(DefaultParameterSetName = 'Array')]
+    param (
+        [Parameter(
+            ParameterSetName = 'Array',
+            Position = 0,
+            ValueFromPipeline = $true,
+            ValueFromPipelineByPropertyName = $true
+        )]
+        [string[]]$Extensions,
+
+        [Parameter(
+            ParameterSetName = 'File',
+            Position = 0,
+            ValueFromPipelineByPropertyName = $true
+        )]
+        [ValidateScript({
+                if (-not (Test-Path -Path $_ -PathType Leaf)) {
+                    throw "File not found: $_"
+                }
+                if (-not ($_ -imatch '\.csv$')) {
+                    throw "File must be a CSV file"
+                }
+                $true
+            })]
+        [string]$CsvPath
+    )
+
+    begin {
+        $resultArray = @()
+    }
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'Array') {
+            $resultArray += $Extensions
+        }
+        else {
+            try {
+                $csvContent = Import-Csv -Path $CsvPath
+                
+                # Find header that starts with 'ext' (case-insensitive)
+                $extHeader = $csvContent[0].PSObject.Properties.Name | Where-Object { $_ -imatch '^ext' }
+                
+                if ($null -eq $extHeader) {
+                    Write-Warning "No header starting with 'ext' found in CSV file"
+                    return @()
+                }
+                elseif ($extHeader.Count -gt 1) {
+                    Write-Warning "Multiple headers starting with 'ext' found in CSV file"
+                    return @()
+                }
+                
+                # Extract values from the matching column
+                $resultArray = $csvContent | ForEach-Object { $_.$extHeader } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            }
+            catch {
+                Write-Error "Error processing CSV file: $_"
+                return @()
+            }
+        }
+    }
+
+    end {
+        return $resultArray
+    }
+}
+
+##### BEGIN SCRIPT #####
+
+if ($CsvSource) {
+    Write-Host "Using CSV file: $CsvSource to gather extensions to activate."
+    $Extensions = Find-Extensions -CsvPath $CsvSource
+}
+Write-Host "Extensions to activate: $Extensions" -ForegroundColor Green
+
+$Subscribers = Get-NSSubscriber -Domain $DomainName
+
+# Get subscriber information
+Write-Host "`nProcessing subscribers..."
+foreach ($Subscriber in $Subscribers) {
+    $Extension = $Subscriber.User
+    Write-Host "`nGetting subscriber information for extension $Extension..."
+    # $subscriber = Get-NSSubscriber -Domain $DomainName -User $Subscriber.User
+
+    if (-not [string]::IsNullOrEmpty($subscriber.ServiceCode)) {
+        Write-Host "Subscriber Service Code found for extension $Extension is '$($subscriber.ServiceCode)' and NOT a blank normal extension/user. Skipping." -ForegroundColor Yellow
+        continue
+    }
+
+    # Check to see if the extension has any devices and warn or error if it doesn't (and is thus unbillable)
+    $extensionCount = Get-NSDeviceCount -Domain $DomainName -User $Subscriber.User
+    if ($extensionCount -eq 0) {
+        if (!$CreateBillable) {
+            Write-Host "No devices found for extension $Extension. Use -CreateBillable switch to allow creation of new device on unbillable extension." -ForegroundColor Red
+            $ringotel_data = [PSCustomObject]@{
+                extension = $Subscriber.User
+                name      = $subscriber.FullName
+                email     = $subscriber.Email
+                username  = ""
+                authname  = ""
+                password  = ""
+            }
+            $csvInactive.Add($ringotel_data)
+            continue
+        }
+        else {
+            if ($Extension -in $Extensions -and !$ReportOnly) {
+                Write-Host "No devices found for extension $Extension. Creating new device on unbillable extension." -ForegroundColor Green
+            }
+            elseif ($Extension -in $Extensions -and $ReportOnly) {
+                Write-Host "No devices found for extension $Extension. Would have created new device on unbillable extension if not in ReportOnly mode." -ForegroundColor Red
+            }
+            else {
+                Write-Host "No devices found for extension $Extension and none requested. Adding to Inactive list." -ForegroundColor Green
+            }
+        }
+    }
+
+    $newDevice = "sip:$Extension$Suffix@$DomainName"
+    $newUser = $Extension
+    Write-Host "NewDevice: $newDevice"
+    $deviceExists = Get-NSDeviceCount -Domain $DomainName -AOR $newDevice
+    if ($deviceExists -gt 0) {
+        # $existingDevice = Get-NSDevice -Domain $DomainName -User $newDevice
+        Write-Host "Device already exists. Won't create, but will retrieve existing device and record in the Already Active list." -ForegroundColor Yellow
+        $new_device = New-NSDevice -Domain $DomainName -Device $newDevice -User $newUser -Mac $newMac -Model $newModel
+        $ringotel_data = [PSCustomObject]@{
+            extension = $Extension
+            name      = $subscriber.FullName
+            email     = $subscriber.Email
+            username  = $newDevice.Split(':')[1].Split('@')[0]
+            authname  = $newDevice.Split(':')[1].Split('@')[0]
+            password  = $new_device.AuthenticationKey
+        }
+        $csvAlreadyActive.Add($ringotel_data)
+    }
+    else {
+        if ($Extension -in $Extensions -and !$ReportOnly) {
+            # Only activate extensions that are in the Extensions array
+            Write-Host "Device does not yet exist for requested extension $Extension. Creating new device and adding to the Active list." -ForegroundColor Green
+            $new_device = New-NSDevice -Domain $DomainName -Device $newDevice -User $newUser -Mac $newMac -Model $newModel
+
+            if ($new_device) {
+                $ringotel_data = [PSCustomObject]@{
+                    extension = $Extension
+                    name      = $subscriber.FullName
+                    email     = $subscriber.Email
+                    username  = $newDevice.Split(':')[1].Split('@')[0]
+                    authname  = $newDevice.Split(':')[1].Split('@')[0]
+                    password  = $new_device.AuthenticationKey
+                }
+                $csvActive.Add($ringotel_data)
+            }
+        }
+        else {
+            if ($Extension -in $Extensions -and $ReportOnly) {
+                Write-Host "In ReportOnly mode or WOULD have created new device for extension $Extension. Listing as Inactive instead." -ForegroundColor Red
+            }
+            $ringotel_data = [PSCustomObject]@{
+                extension = $Extension
+                name      = $subscriber.FullName
+                email     = $subscriber.Email
+                username  = ""
+                authname  = ""
+                password  = ""
+            }
+            $csvInactive.Add($ringotel_data)
+        }
+    }
+}
+
+# Output results summary
+Write-Host "`nProcessing complete!" -ForegroundColor Green
+Write-Host "Active extensions (new): $($csvActive.Count)" -ForegroundColor Green
+Write-Host "Already active extensions: $($csvAlreadyActive.Count)" -ForegroundColor Cyan
+Write-Host "Inactive extensions: $($csvInactive.Count)" -ForegroundColor Yellow
+
+if ($CreateImportFiles) {
+    if ($csvActive.Count -gt 0) {
+        Write-Host "Outputting Import Data to $OutputFilePath" -ForegroundColor Green
+        $csvActive | 
+        Sort-Object -Property extension | 
+        Select-Object extension, name, email, username, authname, password | 
+        Export-Csv -Path $OutputFilePath -NoTypeInformation
+    }
+    if ($csvInactive.Count -gt 0) {
+        Write-Host "Outputting Import Data to $OutputFilePathInactive" -ForegroundColor Yellow
+        $csvInactive | 
+        Sort-Object -Property extension | 
+        Select-Object extension, name, email, username, authname, password | 
+        Export-Csv -Path $OutputFilePathInactive -NoTypeInformation
+    }
+    if ($csvAlreadyActive.Count -gt 0) {
+        Write-Host "Outputting Import Data to $OutputFilePathAlreadyActive" -ForegroundColor Cyan
+        $csvAlreadyActive | 
+        Sort-Object -Property extension | 
+        Select-Object extension, name, email, username, authname, password | 
+        Export-Csv -Path $OutputFilePathAlreadyActive -NoTypeInformation
+    }
+}
