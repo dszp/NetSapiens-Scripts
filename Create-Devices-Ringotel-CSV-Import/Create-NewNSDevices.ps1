@@ -10,8 +10,8 @@
     creates new ones as needed, generating a CSV file for active and inactive extensions.
 
     REQUIREMENTS/DEPENDENCIES:
-    You must do this first: Place the NetSapiensAPI module folder  in the same directory as this script
-    The module is located at: https://github.com/dszp/NetSapiensAPI
+    You must do this first: Place the NetSapiensAPI module folder in the same directory as this script
+    The module is located at: https://github.com/dszp/NetSapiensAPI (requires version 0.1.1 or later).
 
     1Password CLI is required to fetch the NetSapiens API credentials. The 1Password CLI is documented at:
     https://developer.1password.com/docs/cli/get-started/ and you must have a 1Password account and save 
@@ -20,8 +20,8 @@
     system in place of pulling them from 1Password.
 
 .NOTES
-    Version:         0.0.1
-    Last Updated:    2025-02-05
+    Version:         0.0.2
+    Last Updated:    2025-02-06
     Author:          David Szpunar
     
     Version History:
@@ -33,6 +33,9 @@
         * Command-line only (no GUI). Requires NetSapiensAPI module to be in the same directory as this script.
         * NetSapiens API credentials are required; the script pulls them from 1Password using the 1Password 
           CLI by default.
+    0.0.2 - 2025-02-06
+        * Added requirement for NetSapiensAPI module to be version 0.1.1 or later to resolve filtering bug 
+          that prevented proper filtering out of system extensions.
 
 .PARAMETER DomainName
     The NetSapiens domain name to operate on.
@@ -148,6 +151,8 @@ param (
 
 # MUST DO THIS FIRST: Place the NetSapiensAPI module in the same directory as this script
 # The module is located at: https://github.com/dszp/NetSapiensAPI
+# Ensure version 0.1.1 or later is used to resolve filtering bug from module that prevented 
+# proper filtering out of system extensions.
 
 # Get the current script's directory and construct module path
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -159,7 +164,7 @@ if (-not (Test-Path $modulePath)) {
 }
 
 # Import the module
-Import-Module $modulePath -Force
+Import-Module $modulePath -Force -MinimumVersion 0.1.1
 
 # Example configuration - replace with your values
 $NsConfig = @{
