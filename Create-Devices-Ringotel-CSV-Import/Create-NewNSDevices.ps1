@@ -382,6 +382,9 @@ function Test-SubscriberBlocklist {
     if ($Subscriber.FirstName -like '*Ring Group*' -or $Subscriber.LastName -like '*Ring Group*') {
         return New-BlockResult $true "Name contains 'Ring Group'"
     }
+    if ($Subscriber.FirstName -like '*Fax*' -or $Subscriber.LastName -like '*Fax*') {
+        return New-BlockResult $true "Name contains 'Fax'"
+    }
     if ([string]::IsNullOrEmpty($Subscriber.Email)) {
         return New-BlockResult $true "Email field is empty"
     }
