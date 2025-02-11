@@ -20,8 +20,8 @@
     system in place of pulling them from 1Password.
 
 .NOTES
-    Version:         0.0.2
-    Last Updated:    2025-02-06
+    Version:         0.0.3
+    Last Updated:    2025-02-11
     Author:          David Szpunar
     
     Version History:
@@ -36,6 +36,12 @@
     0.0.2 - 2025-02-06
         * Added requirement for NetSapiensAPI module to be version 0.1.1 or later to resolve filtering bug 
           that prevented proper filtering out of system extensions.
+    0.0.3 - 2025-02-11
+        * Updated inactive device export to include username and authname fields, which should prevent duplicate 
+          entries in Ringotel import so duplicate extensions don't get created for inactive display/directory.
+        * Added Test-SubscriberBlocklist function to define an additional list of subscribers to be skipped based 
+          on their properties that make them unsuited to Ringotel activation. Moved check of ServiceCode to indicate 
+          SYSTEM extensions to this check. Feel free to customize this list to your needs.
 
 .PARAMETER DomainName
     The NetSapiens domain name to operate on.
@@ -290,6 +296,109 @@ function Find-Extensions {
     }
 }
 
+<#
+.SYNOPSIS
+Checks if a subscriber should be blocked/skipped from activation based on predefined criteria.
+
+.DESCRIPTION
+The Test-SubscriberBlocklist function evaluates a subscriber's properties against a set of predefined rules to determine if the subscriber should be blocked/skipped from activation.
+
+.PARAMETER Subscriber
+An object representing the subscriber from the NetSapiensAPI module.
+
+.EXAMPLE
+$result = Test-SubscriberBlocklist -Subscriber $subscriberObject
+if ($result.IsBlocked) {
+    Write-Host "Subscriber is blocked: $($result.Reason)"
+} else {
+    Write-Host "Subscriber is not blocked"
+}
+
+.NOTES
+The function checks various conditions including:
+- Service Code is not blank (indicates SYSTEM extension type)
+- Extensions starting with '9'
+- First names starting with 'Paging' or 'Routing Group'
+- Names containing 'On-Call', 'Voicemail', 'Shared', 'Ringer', 'Pager', or 'Ring Group'
+- Empty first and last namespace
+- Domains containing '0000.#####.service'
+- Extensions not starting with a digit
+- Email field is blank (no way to send activation email)
+
+.OUTPUTS
+PSCustomObject
+Returns an object with two properties: IsBlocked (bool) and Reason (string).
+#>
+
+function Test-SubscriberBlocklist {
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Subscriber
+    )
+    $Extension = $Subscriber.User
+
+    # Helper function to return result with reason
+    function New-BlockResult {
+        param([bool]$Blocked, [string]$Reason = '')
+        if ($Blocked -and $Reason) {
+            Write-Verbose "Extension $Extension blocked: $Reason"
+        }
+        return [PSCustomObject]@{
+            IsBlocked = $Blocked
+            Reason    = $Reason
+        }
+    }
+
+    # Check each condition and return appropriate result
+    if (-not [string]::IsNullOrEmpty($Subscriber.ServiceCode)) {
+        return New-BlockResult $true "Service Code indicates SYSTEM extension type '$($subscriber.ServiceCode)'"
+    }
+    if ($Extension -like '9*') {
+        return New-BlockResult $true "Extension starts with '9'"
+    }
+    if ($Subscriber.FirstName -like '*Paging*' -or $Subscriber.LastName -like '*Paging*') {
+        return New-BlockResult $true "Name contains 'Paging'"
+    }
+    if ($Subscriber.FirstName -like '*Routing Group*' -or $Subscriber.LastName -like '*Routing Group*') {
+        return New-BlockResult $true "Name contains 'Routing Group'"
+    }
+    if ($Subscriber.FirstName -like '*On-Call*' -or $Subscriber.LastName -like '*On-Call*') {
+        return New-BlockResult $true "Name contains 'On-Call'"
+    }
+    if ($Subscriber.FirstName -like '*Voicemail*' -or $Subscriber.LastName -like '*Voicemail*') {
+        return New-BlockResult $true "Name contains 'Voicemail'"
+    }
+    if ($Subscriber.FirstName -like '*Shared*' -or $Subscriber.LastName -like '*Shared*') {
+        return New-BlockResult $true "Name contains 'Shared'"
+    }
+    if ($Subscriber.FirstName -like '*Ringer*' -or $Subscriber.LastName -like '*Ringer*') {
+        return New-BlockResult $true "Name contains 'Ringer'"
+    }
+    if ($Subscriber.FirstName -like '*Pager*' -or $Subscriber.LastName -like '*Pager*') {
+        return New-BlockResult $true "Name contains 'Pager'"
+    }
+    if ($Subscriber.FirstName -like '*Ring Group*' -or $Subscriber.LastName -like '*Ring Group*') {
+        return New-BlockResult $true "Name contains 'Ring Group'"
+    }
+    if ([string]::IsNullOrEmpty($Subscriber.Email)) {
+        return New-BlockResult $true "Email field is empty"
+    }
+    if ($Subscriber.Domain -like '*0000.#####.service*') {
+        return New-BlockResult $true "Domain contains '0000.#####.service'"
+    }
+    if (-not $Extension[0] -match '\d') {
+        return New-BlockResult $true "Extension doesn't start with a digit"
+    }
+    if ([string]::IsNullOrEmpty($Subscriber.FirstName) -and [string]::IsNullOrEmpty($Subscriber.LastName)) {
+        return New-BlockResult $true "Both first and last names are empty"
+    }
+
+    # If no conditions matched, return not blocked
+    return New-BlockResult $false
+}
+
 ##### BEGIN SCRIPT #####
 
 if ($CsvSource) {
@@ -305,14 +414,14 @@ Write-Host "`nProcessing subscribers..."
 foreach ($Subscriber in $Subscribers) {
     $Extension = $Subscriber.User
     Write-Host "`nGetting subscriber information for extension $Extension..."
-    # $subscriber = Get-NSSubscriber -Domain $DomainName -User $Subscriber.User
 
-    if (-not [string]::IsNullOrEmpty($subscriber.ServiceCode)) {
-        Write-Host "Subscriber Service Code found for extension $Extension is '$($subscriber.ServiceCode)' and NOT a blank normal extension/user. Skipping." -ForegroundColor Yellow
+    $blockResult = Test-SubscriberBlocklist -Subscriber $Subscriber -Verbose
+    if ($blockResult.IsBlocked) {
+        # Write-Host "Subscriber $Extension is blocked because: $($blockResult.Reason)" -ForegroundColor Yellow
         continue
     }
 
-    # Check to see if the extension has any devices and warn or error if it doesn't (and is thus unbillable)
+    # Check to see if the extension has any devices and warn or error if it doesn't (and is thus non-billable)
     $extensionCount = Get-NSDeviceCount -Domain $DomainName -User $Subscriber.User
     if ($extensionCount -eq 0) {
         if (!$CreateBillable) {
@@ -321,8 +430,8 @@ foreach ($Subscriber in $Subscribers) {
                 extension = $Subscriber.User
                 name      = $subscriber.FullName
                 email     = $subscriber.Email
-                username  = ""
-                authname  = ""
+                username  = "$Extension$Suffix"
+                authname  = "$Extension$Suffix"
                 password  = ""
             }
             $csvInactive.Add($ringotel_data)
@@ -370,8 +479,8 @@ foreach ($Subscriber in $Subscribers) {
                     extension = $Extension
                     name      = $subscriber.FullName
                     email     = $subscriber.Email
-                    username  = $newDevice.Split(':')[1].Split('@')[0]
-                    authname  = $newDevice.Split(':')[1].Split('@')[0]
+                    username  = "$Extension$Suffix"
+                    authname  = "$Extension$Suffix"
                     password  = $new_device.AuthenticationKey
                 }
                 $csvActive.Add($ringotel_data)
@@ -385,8 +494,8 @@ foreach ($Subscriber in $Subscribers) {
                 extension = $Extension
                 name      = $subscriber.FullName
                 email     = $subscriber.Email
-                username  = ""
-                authname  = ""
+                username  = "$Extension$Suffix"
+                authname  = "$Extension$Suffix"
                 password  = ""
             }
             $csvInactive.Add($ringotel_data)
